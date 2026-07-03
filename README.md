@@ -5,6 +5,10 @@ file, then build and train DeepSeek's real **DSpark** drafter — and benchmark 
 honestly against a dumb baseline. Torch only, runs on a laptop **CPU**, no GPU, no
 downloads beyond one small pretrained model (`HuggingFaceTB/SmolLM2-135M`).
 
+**📖 Prefer text? [LESSON.md](LESSON.md) is the full course as a written,
+follow-top-to-bottom tutorial** — diagrams, tasks, code, and the measured
+outputs at every step.
+
 ## Run it
 
 ```bash
@@ -29,7 +33,7 @@ python eval_accept.py         # the honest acceptance benchmark
 | prompt set | bigram (free) | dspark trained | dspark raw |
 | --- | --- | --- | --- |
 | repetitive (code/technical) | **47%** | 32% | 0% |
-| novel prose (held-out) | **22%** | 5% | 2% |
+| novel prose (held-out) | **22%** | 5% | 0% |
 
 The zero-training n-gram ("prompt-lookup decoding") *beats* our from-scratch neural
 drafter on this small greedy setup — a model's greedy output repeats itself, and the
