@@ -9,15 +9,36 @@ baseline that turns out to win. Every number in here was measured on a laptop
 CPU with the code in this repo. There's also a [video version](README.md) of
 this exact build.
 
-**What you need:** Python, `pip install -r requirements.txt` (torch +
-transformers), ~1 GB disk for the small model. No GPU. Every script caps torch
-at 3 threads so your laptop stays cool.
+**The route, start to finish:**
+
+0. Set up (2 min) — Python env, torch + transformers.
+1. Load a real target model, write plain greedy decoding — the baseline we must match.
+2. Build the dumbest drafter (a bigram table) + the **lossless verifier**, and *prove* byte-identical output.
+3. Build DSpark's real drafter: parallel backbone + low-rank Markov thread, reusing the frozen target.
+4. Train it by distillation (~1 min on CPU) and watch acceptance go 0% → ~30%.
+5. Benchmark honestly against the free baseline — and get humbled, and understand why.
 
 **How to use this file:** each chapter gives you the idea, then a **✏️ Task**
 to write the code yourself, then the reference code (also in this repo as a
 runnable file), then the output you should see. Type it — don't paste it. The
 point of from-scratch is to be the person who can tell when the code is wrong,
 and you'll meet a concrete example of exactly that in chapter 2.
+
+---
+
+## Step 0 — Setup
+
+Two ways to follow:
+
+- **From scratch (recommended):** make an empty folder and write every file
+  yourself as you go. `pip install "torch>=2.2" "transformers>=4.44"`. Use this
+  repo only to unstick yourself.
+- **Follow-along:** `git clone https://github.com/vukrosic/dspark-from-scratch`
+  and `pip install -r requirements.txt`, then read the files as you reach them.
+
+No GPU needed; the model (`HuggingFaceTB/SmolLM2-135M`, ~270 MB download) runs
+on CPU, and the training scripts cap torch at 3 threads so your laptop stays
+cool. First model load downloads it automatically.
 
 ---
 
@@ -166,7 +187,33 @@ def speculative_greedy(ids, n, drafter, k=4):
 
 A speedup that changes your output is worthless, so we *assert* the guarantee.
 Write `check_lossless.py`: run `plain_greedy` and `speculative_greedy` on a few
-prompts and `torch.equal` the results (full file in this repo). Then:
+prompts and `torch.equal` the results:
+
+```python
+import torch
+from spec_decode import BigramDrafter, plain_greedy, speculative_greedy, tok
+
+PROMPTS = [
+    "The key idea behind speculative decoding is",
+    "Once upon a time, in a small village",
+    "def fibonacci(n):",
+]
+N = 40
+
+for p in PROMPTS:
+    ids = tok(p, return_tensors="pt").input_ids
+    base = plain_greedy(ids, N)
+    spec, stats = speculative_greedy(ids, N, BigramDrafter(), k=4)
+    same = torch.equal(base[:, : ids.shape[1] + N], spec[:, : ids.shape[1] + N])
+    rate = stats["accepted"] / max(1, stats["proposed"])
+    print(f"[{'OK ' if same else '!! MISMATCH'}] lossless={same}  "
+          f"passes={stats['passes']}/{N}  accept={rate:.0%}  | {p!r}")
+    assert same, f"LOSSLESS CONTRACT BROKEN for prompt: {p!r}"
+
+print("\nAll prompts byte-identical to plain decoding. Lossless contract holds.")
+```
+
+Then:
 
 ```bash
 python check_lossless.py
@@ -239,6 +286,40 @@ Create `dspark_drafter.py`. Build in this order (full file in this repo):
    `lm_head` as plain references (via `object.__setattr__`) so they are *not*
    registered as drafter parameters and never get trained.
 
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DSparkDrafter(nn.Module):
+    def __init__(self, target, block=5, markov_rank=64, window=8):
+        super().__init__()
+        dim = int(target.config.hidden_size)
+        self.dim, self.vocab = dim, int(target.config.vocab_size)
+        self.block, self.window = block, window
+
+        # parallel backbone: ONE cheap pass -> a base hidden for ALL k positions
+        self.base_ctx = nn.Sequential(nn.Linear(dim, dim), nn.GELU())
+        self.pos_emb = nn.Parameter(torch.zeros(block, dim))
+        self.base_mlp = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+
+        # low-rank Markov head: a rank-r nudge driven ONLY by the preceding token
+        self.markov_down = nn.Linear(dim, markov_rank, bias=False)
+        self.markov_up = nn.Linear(markov_rank, dim, bias=False)
+
+        self.head_norm = nn.LayerNorm(dim)
+        self.conf_head = nn.Linear(dim, 1)   # per-position P(accept), for later
+
+        # borrowed FROZEN target parts — plain refs, NOT registered as
+        # parameters, so they are never trained
+        object.__setattr__(self, "_emb", target.get_input_embeddings())
+        object.__setattr__(self, "_lm_head", target.lm_head)
+```
+
+(You'll also want two small helpers — `window_of(ids)` grabs the last `window`
+token ids, left-padded, and `_window_ctx` embeds them, means them, and runs
+`base_ctx`. Both are a few lines; see the repo file.)
+
 The core math, shared by training and inference:
 
 ```python
@@ -270,8 +351,29 @@ def propose(self, ids, k):
     return torch.stack(out, dim=1)
 ```
 
-**Checkpoint:** plug the *untrained* drafter into the chapter-2 verifier. It
-proposes garbage (≈0% acceptance) and the output is **still perfectly
+**Checkpoint:** plug the *untrained* drafter into the chapter-2 verifier:
+
+```bash
+python -c "
+from spec_decode import *
+from dspark_drafter import DSparkDrafter
+import torch
+d = DSparkDrafter(target, block=5).eval()
+ids = tok('def fibonacci(n):', return_tensors='pt').input_ids
+base = plain_greedy(ids, 32)
+out, st = speculative_greedy(ids, 32, d, k=5)
+print('lossless:', torch.equal(base[:, :ids.shape[1]+32], out[:, :ids.shape[1]+32]))
+print('stats   :', st)"
+```
+
+Measured here:
+
+```
+lossless: True
+stats   : {'proposed': 32, 'accepted': 0, 'passes': 32}
+```
+
+It proposes garbage — 0 of 32 accepted — and the output is **still perfectly
 lossless**. Correctness never depended on the drafter — now we're free to train
 it however we like.
 
@@ -323,19 +425,25 @@ AFTER  training  accept=28%  passes=47/64
 saved trained drafter -> drafter.pt
 ```
 
-Loss starts around 7 (clueless) and lands near 0.14; acceptance goes **0% →
-~30%**. Training did a real thing, and it saved `drafter.pt`. …but look at that
-last line — the free bigram is at 41%. Let's measure this properly.
+The untrained loss is ~12.9 (measured on the first batch — essentially random
+guessing over a 49k-token vocabulary) and lands near 0.14; acceptance goes
+**0% → ~30%**. Training did a real thing, and it saved `drafter.pt`. …but look
+at that last line — the free bigram is at 41%. Let's measure this properly.
 
 ---
 
 ## Chapter 5 — Benchmark honestly (the dumb baseline wins)
 
 The rule that separates research from marketing: **always benchmark against
-the dumb baseline.** Ours is the free bigram from chapter 2. Three drafters —
-bigram, untrained DSpark, trained DSpark — on two prompt sets: REPETITIVE
-(code/technical) and NOVEL prose the drafter has never seen. Losslessness
-asserted on every single run.
+the dumb baseline.** Ours is the free bigram from chapter 2.
+
+### ✏️ Task 7 — the honest benchmark
+
+Write `eval_accept.py` (full file in this repo): three drafters — bigram,
+untrained DSpark, trained DSpark — on two prompt sets, REPETITIVE
+(code/technical) and NOVEL prose the drafter has never seen. For every single
+run, also run `plain_greedy` and assert the output is byte-identical. Report
+acceptance rate and target passes used per 32 tokens.
 
 ```bash
 python eval_accept.py
