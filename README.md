@@ -38,7 +38,7 @@ python eval_accept.py         # the honest acceptance benchmark
 The zero-training n-gram ("prompt-lookup decoding") *beats* our from-scratch neural
 drafter on this small greedy setup — a model's greedy output repeats itself, and the
 n-gram looks those repeats up for free. Training still did a real thing (0% → 32%,
-loss 7.3 → 0.14) and is always lossless. The real DSpark wins where it's used: a much
+loss ~12.9 → 0.14) and is always lossless. The real DSpark wins where it's used: a much
 stronger backbone and a **large** target where the drafter's cost is negligible and
 repetition is rarer. Benchmark against the dumb baseline — always.
 
